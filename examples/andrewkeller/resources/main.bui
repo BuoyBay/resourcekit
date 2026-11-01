@@ -1,0 +1,24 @@
+Import resourcekit
+
+Class TemplateProvider Implements ResourceProvider Of String
+    Public Property Calls As Integer = 0
+
+    Public Function Fetch(key As String) As ResourceResult Of String
+        Calls += 1
+        If String.Compare(key, "welcome", True) <> 0 Then Return ResourceResult Of String.Missing()
+        Return ResourceResult Of String.Present("Welcome aboard", 1000000, 14)
+    End Function
+End Class
+
+Sub Main()
+    Dim provider As New TemplateProvider()
+    Dim source As ResourceProvider Of String = provider
+    Dim sources As Array Of ResourceProvider Of String = [source]
+    Dim cache As New ResourceCache Of String(sources, 16, 65536)
+    Print cache.Fetch("welcome").Value
+    Print cache.Fetch("welcome").Value
+    If provider.Calls <> 1 Then Throw New Exception("Expected one provider call")
+    If cache.Fetch("unknown").IsFound Then Throw New Exception("Unexpected resource")
+    Print "Template read twice; provider called once for its cached value"
+    cache.Clear()
+End Sub

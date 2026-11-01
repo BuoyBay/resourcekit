@@ -1,0 +1,254 @@
+''' A typed provider outcome. Missing is distinct from an empty or Nil value.
+Public Class ResourceResult Of T
+    Private Property mFound As Boolean = False
+    Private Property mValue As T
+    Private Property mTTL As Integer = 0
+    Private Property mCost As Integer = 0
+
+    Public Sub Constructor()
+    End Sub
+
+    Public Shared Function Present(value As T, ttlMicroseconds As Integer = 0, declaredBytes As Integer = 0) As ResourceResult Of T
+        If ttlMicroseconds < 0 Or declaredBytes < 0 Then Throw New InvalidArgumentException("Resource TTL and declared cost must be nonnegative")
+        Dim outcome As New ResourceResult Of T()
+        outcome.mFound = True
+        outcome.mValue = value
+        outcome.mTTL = ttlMicroseconds
+        outcome.mCost = declaredBytes
+        Return outcome
+    End Function
+
+    Public Shared Function Missing() As ResourceResult Of T
+        Return New ResourceResult Of T()
+    End Function
+
+    Public Property IsFound As Boolean
+        Get
+            Return mFound
+        End Get
+    End Property
+
+    Public Property Value As T
+        Get
+            If Not mFound Then Throw New InvalidArgumentException("Missing resource has no value")
+            Return mValue
+        End Get
+    End Property
+
+    Public Property TTL As Integer
+        Get
+            Return mTTL
+        End Get
+    End Property
+
+    Public Property DeclaredBytes As Integer
+        Get
+            Return mCost
+        End Get
+    End Property
+End Class
+
+Public Interface ResourceProvider Of T
+    Function Fetch(key As String) As ResourceResult Of T
+End Interface
+
+Public Interface ResourceClock
+    Function NowMicroseconds() As Integer
+End Interface
+
+Private Class SystemResourceClock Implements ResourceClock
+    Public Function NowMicroseconds() As Integer
+        Return System.Microseconds()
+    End Function
+End Class
+
+''' Single-threaded ordered provider chain with bounded LRU and monotonic TTLs.
+Public Class ResourceCache Of T
+    Private Property mProviders As Array Of ResourceProvider Of T = []
+    Private Property mKeys As Array Of String = []
+    Private Property mResults As Array Of ResourceResult Of T = []
+    Private Property mStarted As Array Of Integer = []
+    Private Property mClock As ResourceClock
+    Private Property mEntryLimit As Integer
+    Private Property mByteLimit As Integer
+    Private Property mBytes As Integer = 0
+    Private Property mLastNow As Integer = 0
+    Private Property mBusy As Boolean = False
+
+    Public Sub Constructor(providers As Array Of ResourceProvider Of T, maxEntries As Integer = 1000, maxDeclaredBytes As Integer = 67108864)
+        Me.Initialize(providers, maxEntries, maxDeclaredBytes, New SystemResourceClock())
+    End Sub
+
+    Public Sub Constructor(providers As Array Of ResourceProvider Of T, maxEntries As Integer, maxDeclaredBytes As Integer, clock As ResourceClock)
+        Me.Initialize(providers, maxEntries, maxDeclaredBytes, clock)
+    End Sub
+
+    Private Sub Initialize(providers As Array Of ResourceProvider Of T, maxEntries As Integer, maxDeclaredBytes As Integer, clock As ResourceClock)
+        If maxEntries < 1 Or maxEntries > 100000 Then Throw New InvalidArgumentException("Resource entry limit must be in 1..100000")
+        If maxDeclaredBytes < 0 Then Throw New InvalidArgumentException("Resource declared-byte limit must be nonnegative")
+        If Array.Count(providers) > 1024 Then Throw New InvalidArgumentException("At most 1024 resource providers are allowed")
+        For Each provider As ResourceProvider Of T In providers
+            If provider Is Nil Then Throw New InvalidArgumentException("Resource provider must not be Nil")
+            Array.Append(mProviders, provider)
+        Next
+        mEntryLimit = maxEntries
+        mByteLimit = maxDeclaredBytes
+        If clock Is Nil Then
+            mClock = New SystemResourceClock()
+        Else
+            mClock = clock
+        End If
+    End Sub
+
+    Public Property Count As Integer
+        Get
+            Return Array.Count(mKeys)
+        End Get
+    End Property
+
+    Public Property CachedBytes As Integer
+        Get
+            Return mBytes
+        End Get
+    End Property
+
+    Public Property Capacity As Integer
+        Get
+            Return mEntryLimit
+        End Get
+    End Property
+
+    Public Property DeclaredByteLimit As Integer
+        Get
+            Return mByteLimit
+        End Get
+    End Property
+
+    Private Sub CheckIdle()
+        If mBusy Then Throw New InvalidArgumentException("Resource cache operations cannot reenter")
+    End Sub
+
+    Private Sub ValidateKey(key As String)
+        If String.LenBytes(key) > 4096 Then Throw New InvalidArgumentException("Resource keys must be at most 4096 UTF-8 bytes")
+    End Sub
+
+    Private Function ReadClock() As Integer
+        Dim now As Integer = mClock.NowMicroseconds()
+        If now < 0 Or now < mLastNow Then Throw New InvalidArgumentException("Resource clock must be nonnegative and monotonic")
+        mLastNow = now
+        Return now
+    End Function
+
+    Private Function FindKey(key As String) As Integer
+        For i As Integer = 0 To Array.Count(mKeys) - 1
+            If String.Compare(mKeys(i), key, True) = 0 Then Return i
+        Next
+        Return -1
+    End Function
+
+    Private Sub RemoveEntry(index As Integer)
+        ' Keep the payload alive until every parallel array is consistent.
+        Dim retired As ResourceResult Of T = mResults(index)
+        mBytes -= mResults(index).DeclaredBytes
+        Array.RemoveAt(mKeys, index)
+        Array.RemoveAt(mResults, index)
+        Array.RemoveAt(mStarted, index)
+    End Sub
+
+    Private Function PruneAt(now As Integer) As Integer
+        Dim removed As Integer = 0
+        Dim index As Integer = Array.Count(mKeys) - 1
+        While index >= 0
+            If now - mStarted(index) >= mResults(index).TTL Then
+                Me.RemoveEntry(index)
+                removed += 1
+            End If
+            index -= 1
+        End While
+        Return removed
+    End Function
+
+    Public Function Fetch(key As String) As ResourceResult Of T
+        Me.CheckIdle()
+        Me.ValidateKey(key)
+        mBusy = True
+        Try
+            Dim now As Integer = Me.ReadClock()
+            Me.PruneAt(now)
+            Dim index As Integer = Me.FindKey(key)
+            If index >= 0 Then
+                Dim outcome As ResourceResult Of T = mResults(index)
+                Dim started As Integer = mStarted(index)
+                Me.RemoveEntry(index)
+                Array.Append(mKeys, key)
+                Array.Append(mResults, outcome)
+                Array.Append(mStarted, started)
+                mBytes += outcome.DeclaredBytes
+                Return outcome
+            End If
+            For Each provider As ResourceProvider Of T In mProviders
+                Dim outcome As ResourceResult Of T = provider.Fetch(key)
+                If outcome Is Nil Then Throw New InvalidArgumentException("Resource provider returned Nil instead of an explicit outcome")
+                If outcome.IsFound Then
+                    If outcome.TTL = 0 Or outcome.DeclaredBytes > mByteLimit Then Return outcome
+                    ' TTL starts after the provider successfully returns.
+                    now = Me.ReadClock()
+                    ' Do not represent an unrepresentable expiry by wrapping.
+                    If outcome.TTL > 9223372036854775807 - now Then Return outcome
+                    Me.PruneAt(now)
+                    While Array.Count(mKeys) >= mEntryLimit Or outcome.DeclaredBytes > mByteLimit - mBytes
+                        Me.RemoveEntry(0)
+                    End While
+                    Array.Append(mKeys, key)
+                    Array.Append(mResults, outcome)
+                    Array.Append(mStarted, now)
+                    mBytes += outcome.DeclaredBytes
+                    Return outcome
+                End If
+            Next
+            Return New ResourceResult Of T()
+        Finally
+            mBusy = False
+        End Try
+    End Function
+
+    Public Function Invalidate(key As String) As Boolean
+        Me.CheckIdle()
+        Me.ValidateKey(key)
+        mBusy = True
+        Try
+            Dim index As Integer = Me.FindKey(key)
+            If index < 0 Then Return False
+            Me.RemoveEntry(index)
+            Return True
+        Finally
+            mBusy = False
+        End Try
+    End Function
+
+    Public Sub Clear()
+        Me.CheckIdle()
+        mBusy = True
+        Try
+            ' Publish an empty, consistent cache before releasing user payloads.
+            Dim retired As Array Of ResourceResult Of T = mResults
+            mKeys = []
+            mResults = []
+            mStarted = []
+            mBytes = 0
+            Array.Clear(retired)
+        Finally
+            mBusy = False
+        End Try
+    End Sub
+
+    Public Function PruneExpired() As Integer
+        Me.CheckIdle()
+        mBusy = True
+        Try
+            Return Me.PruneAt(Me.ReadClock())
+        Finally
+            mBusy = False
+        End Try
+    End Function
+End Class
