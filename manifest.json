@@ -1,1 +1,1 @@
-{"schema":1,"name":"resourcekit","version":"0.1.0","description":"Typed ordered resource providers with bounded LRU caching and monotonic TTLs"}
+{"schema":1,"name":"resourcekit","version":"0.1.0","description":"Resolve ordered resources with caching and expiry"}
