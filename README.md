@@ -1,4 +1,4 @@
-# Ordered resource lookup with cache and expiry
+# Ordered resource lookup
 
 `Import resourcekit` adds typed ordered resource providers and a bounded LRU
 cache. This package is synchronous and **single-threaded**. It neither fetches
