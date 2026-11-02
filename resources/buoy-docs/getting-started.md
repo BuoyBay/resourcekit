@@ -25,6 +25,4 @@ Use `Invalidate(key)` after a resource changes, or `Clear()` to release all
 cached results. Zero TTL deliberately bypasses caching. The cache does not watch
 files, reload resources automatically or deep-copy mutable payloads.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 See the [API reference](api.md) and [overview](index.md).

@@ -57,5 +57,3 @@ cache a failed provider result. Callbacks may use a different cache. There is no
 locking; callers must keep each cache and its mutable collaborators on one
 thread. Release any provider/clock back-reference to the cache to avoid ARC
 ownership cycles.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
